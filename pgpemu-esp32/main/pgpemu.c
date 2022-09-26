@@ -9,6 +9,8 @@
 
 
 #include "esp_system.h"
+#include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
@@ -21,6 +23,7 @@
 #include "secrets.h"
 #include "esp_gatt_common_api.h"
 
+#define uS_TO_S 1000000ULL
 #define GATTS_TABLE_TAG "PGPEMU"
 
 #define PROFILE_NUM                 1
@@ -68,6 +71,7 @@ uint8_t bt_mac[6];
 
 uint8_t session_key[16];
 int cert_state = 0;
+bool disconnected = true;
 
 
 typedef struct {
@@ -369,18 +373,21 @@ static void generate_first_challenge()
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
+    disconnected = false;
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
             adv_config_done &= (~ADV_CONFIG_FLAG);
             if (adv_config_done == 0){
                 esp_ble_gap_start_advertising(&adv_params);
             }
+            disconnected = true;
             break;
         case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
             adv_config_done &= (~SCAN_RSP_CONFIG_FLAG);
             if (adv_config_done == 0){
                 esp_ble_gap_start_advertising(&adv_params);
             }
+            disconnected = true;
             break;
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
             /* advertising start complete event to indicate advertising start successfully or failed */
@@ -389,6 +396,7 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             }else{
                 ESP_LOGI(GATTS_TABLE_TAG, "advertising start successfully");
             }
+            disconnected = true;
             break;
         case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
             if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
@@ -471,11 +479,13 @@ void handle_protocol(esp_gatt_if_t gatts_if,
                     const uint8_t *prepare_buf, int datalen,
                     int conn_id)
 {
+    disconnected = false;
     switch (cert_state) {
 
 	case 0:
         {
-		if (datalen == 20) { //just assume server responds correctly
+		disconnected = true;
+        if (datalen == 20) { //just assume server responds correctly
 			uint8_t notify_data[4];
 			memset(notify_data, 0, 4);
 			notify_data[0] = 0x01;
@@ -547,6 +557,7 @@ void handle_protocol(esp_gatt_if_t gatts_if,
 					    conn_id,
 					    certificate_handle_table[IDX_CHAR_SFIDA_COMMANDS_VAL],
 					    sizeof(notify_data), notify_data, false);
+        ESP_LOGI(GATTS_TABLE_TAG, "Connected successfully!");
 		break;
         }
         case 3:
@@ -650,6 +661,7 @@ void pgp_exec_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepar
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
+    disconnected = false;
     switch (event) {
         case ESP_GATTS_REG_EVT:{
             esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(PGP_DEVICE_NAME);
@@ -776,6 +788,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_CONF_EVT, status = %d", param->conf.status);
             break;
         case ESP_GATTS_START_EVT:
+            disconnected = true;
             ESP_LOGI(GATTS_TABLE_TAG, "SERVICE_START_EVT, status %d, service_handle %d", param->start.status, param->start.service_handle);
             break;
         case ESP_GATTS_CONNECT_EVT:
@@ -797,7 +810,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_DISCONNECT_EVT, reason = %d", param->disconnect.reason);
-	    cert_state = 0;
+            cert_state = 0;
+            disconnected = true;
 
             esp_ble_gap_start_advertising(&adv_params);
             break;
@@ -996,6 +1010,46 @@ static void uart_event_task(void *pvParameters)
 }
 
 
+static const char *TAG_POWERSAVE = "POWERSAVE";
+
+static void power_save_task(void *pvParameters)	// save power if not connected and periodically wake up
+{
+    ESP_LOGI(TAG_POWERSAVE, "[powersave task start]");
+    esp_wifi_stop();
+    disconnected = true;
+    bool last_dis_state = true;
+    int connection_init = 0;
+    int boot_millis = 0;
+    int last_awake = 10000; // 10s to connect quickly right after startup
+
+    while (true)
+    {
+        vTaskDelay(50);
+        boot_millis = xTaskGetTickCount() * 10;
+
+        if (disconnected){
+            if (boot_millis - last_awake > 400){
+                ESP_LOGI(TAG_POWERSAVE, "not connected for: %i ms -> light sleep", boot_millis - last_awake);
+                esp_sleep_enable_timer_wakeup(uS_TO_S * 10);
+                esp_light_sleep_start();
+                last_awake = boot_millis;
+            }
+        }else{
+            last_awake = boot_millis;
+            if (last_dis_state){ // state switched to connected
+                connection_init = boot_millis;
+            }
+            if (cert_state != 6 && boot_millis - connection_init > 60000){ // connection timeout
+                disconnected = true;
+                ESP_LOGI(TAG_POWERSAVE, "connection timed out");
+            }
+        }
+        
+        ESP_LOGI(TAG_POWERSAVE, "connected: %d", !disconnected);
+        last_dis_state = disconnected;
+    }
+}
+
 void app_main()
 {
     esp_err_t ret;
@@ -1032,8 +1086,8 @@ void app_main()
 
    //Create a task to handler UART event from ISR
     xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
-
     xTaskCreate(auto_button_task, "auto_button_task", 2048, NULL, 12, NULL);
+    xTaskCreate(power_save_task, "power_save_task", 2048, NULL, 12, NULL);
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
