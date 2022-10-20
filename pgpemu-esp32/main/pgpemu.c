@@ -1079,6 +1079,23 @@ static void power_save_task(void *pvParameters)	// save power if not connected a
     }
 }
 
+static const char *TAG_OVERDISCHARGE = "OVERDISCHARGE PROTECTION";
+
+static void overdischarge_protection_task(void *pvParameters)	// enter deep sleep forever if the battery reaches 0%
+{
+    ESP_LOGI(TAG_OVERDISCHARGE, "[overdischarge protection task start]");
+
+    while (true)
+    {
+        if (read_battery_value() == 0){
+            ESP_LOGI(TAG_OVERDISCHARGE, "battery reached 0%% -> deep sleep forever to prevent overdischarge");
+            esp_sleep_enable_timer_wakeup(uS_TO_S * 10000000);
+            esp_deep_sleep_start();
+        }
+        vTaskDelay(10000);
+    }
+}
+
 void app_main()
 {
     esp_err_t ret;
@@ -1119,6 +1136,7 @@ void app_main()
     xTaskCreate(uart_event_task, "uart_event_task", 2048, NULL, 12, NULL);
     xTaskCreate(auto_button_task, "auto_button_task", 2048, NULL, 12, NULL);
     xTaskCreate(power_save_task, "power_save_task", 2048, NULL, 12, NULL);
+    xTaskCreate(overdischarge_protection_task, "overdischarge_protection_task", 2048, NULL, 12, NULL);
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
