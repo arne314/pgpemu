@@ -1,7 +1,9 @@
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "driver/adc.h"
 #include "driver/uart.h"
 #include "esp32/aes.h"
 
@@ -13,6 +15,7 @@
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "esp_adc_cal.h"
 #include "esp_bt.h"
 
 #include "esp_gap_ble_api.h"
@@ -152,7 +155,6 @@ static uint8_t cert_buffer[378];
 
 static const uint16_t GATTS_SERVICE_UUID_BATTERY      = 0x180f;
 static const uint16_t GATTS_CHAR_UUID_BATTERY_LEVEL = 0x2a19;
-static const uint8_t battery_char_value[1]                 = {0x60};
 
 
 static uint8_t reconnect_challenge[32];
@@ -172,7 +174,7 @@ static const esp_gatts_attr_db_t gatt_db_battery[BATTERY_LAST_IDX] = {
     /* Characteristic Value */
     [IDX_CHAR_BATTERY_LEVEL_VAL] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_BATTERY_LEVEL, ESP_GATT_PERM_READ,
-      MAX_VALUE_LENGTH, sizeof(battery_char_value), (uint8_t *)battery_char_value}},
+      MAX_VALUE_LENGTH, 8, (uint8_t *)dummy_value}},
 
     /* Client Characteristic Configuration Descriptor */
     [IDX_CHAR_BATTERY_LEVEL_CFG]  =
@@ -659,6 +661,29 @@ void pgp_exec_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepar
     prepare_write_env->prepare_len = 0;
 }
 
+static void setup_battery_measurement(){
+    esp_adc_cal_characteristics_t adc1_chars;
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_DEFAULT, 0, &adc1_chars);
+    adc1_config_width(ADC_WIDTH_BIT_DEFAULT);
+    adc1_config_channel_atten(ADC1_CHANNEL_7, ADC_ATTEN_DB_11);
+}
+
+static uint8_t read_battery_value()
+{
+    uint8_t percentage = 50; // default value if the measurement failes
+    float voltage = adc1_get_raw(ADC1_CHANNEL_7) / 4096.0 * 6.79;
+    if (voltage > 0.5){ // measurement successful
+        percentage = 3775.5 * pow(voltage, 4) - 59209 * pow(voltage, 3) + 347670 * pow(voltage, 2) - 905717 * voltage + 883083;
+        if (voltage > 4.19) percentage = 100;
+        else if (voltage <= 3.70) percentage = 0;
+        if (percentage > 100) percentage = 100;
+        else if (percentage < 0) percentage = 0;
+    }
+    
+    ESP_LOGI("BATTERY", "voltage: %f percentage: %i", voltage, percentage);
+    return percentage;
+}
+
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
     disconnected = false;
@@ -706,7 +731,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 			ESP_LOGI(GATTS_TABLE_TAG, "DATA SENT TO APP");
 			esp_log_buffer_hex(GATTS_TABLE_TAG, cert_buffer, 52);
 		}
-		break;
+            if (battery_handle_table[IDX_CHAR_BATTERY_LEVEL_VAL] == param->read.handle){
+                uint8_t battery_value[] = {read_battery_value()};
+                esp_ble_gatts_set_attr_value(battery_handle_table[IDX_CHAR_BATTERY_LEVEL_VAL], 8, battery_value);
+            }
+		    break;
         case ESP_GATTS_WRITE_EVT:
 		ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_WRITE_EVT: %s", char_name_from_handle(param->write.handle));
 		if (!param->write.is_prep){
@@ -1062,6 +1091,8 @@ void app_main()
     }
     ESP_ERROR_CHECK( ret );
 
+    // setup io to measure the battery level
+    setup_battery_measurement();
 
     /* Configure parameters of an UART driver,
      * communication pins and install the driver */
